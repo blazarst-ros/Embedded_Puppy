@@ -1,0 +1,22 @@
+# Keil MDK build outputs
+MDK-ARM/CubeMX/
+*.axf
+*.hex
+*.bin
+*.elf
+*.map
+*.crf
+*.d
+*.o
+*.lst
+*.build_log.htm
+MDK-ARM/build.log
+
+# Local Keil IDE state
+*.uvguix.*
+*.uvoptx
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
