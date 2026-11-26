@@ -85,21 +85,19 @@ typedef struct
 #define BODY_TRACK_MM           82.0f    /* 左右腿轴距（本测试不转向，仅保留标定） */
 #define LEG_LENGTH_MM           46.0f    /* 腿长（舵机轴心到脚底） */
 
-/* ---- 步态参数（沿用 ble_walk_test 的爬行步态）----
+/* ---- 步态参数（对角小跑 Trot）----
    单舵机腿绕水平轴前后摆，靠支撑相/摆动相的时间不对称产生净位移：
      - 支撑相占 GAIT_STANCE_PCT，脚缓慢划动，接地时间长、冲量大；
      - 摆动相快速回摆，接地时间短、反向冲量小。
+   两组对角腿同步：PA8+PA11 与 PA9+PA10，交替摆动。
 
-   周期由 600ms 放慢到 800ms：摆动相从 150ms 延长到 200ms，
-   同样 46° 的回摆只需要约 230°/s（600ms 时要 300°/s 以上）。
-   舵机在负载下跟不上时，快摆会被拖得和支撑相一样慢，占空比
-   退化成 50%，地面冲量重新抵消，表现就是“腿在动、狗不走”的
-   原地踏步。走稳以后如果嫌慢，再把本宏逐步改回 600 观察。 */
+   周期 550ms、支撑 80%：支撑段约 440ms，复位段约 110ms；
+   44mm 步幅对应约 ±28.6°，约 57°摆角在复位段内完成。 */
 #define GAIT_CENTER_DEG         90       /* 腿竖直向下 */
-#define GAIT_STRIDE_MM          36.0f    /* 前进每周期脚的前后行程 */
-#define GAIT_CYCLE_MS           800U     /* 一个完整步态周期 */
+#define GAIT_STRIDE_MM          44.0f    /* 前进每周期脚的前后行程 */
+#define GAIT_CYCLE_MS           550U     /* 一个完整步态周期 */
 #define GAIT_TICK_MS            20U      /* 步态更新周期 */
-#define GAIT_STANCE_PCT         75U      /* 支撑相占比，1~99 */
+#define GAIT_STANCE_PCT         80U      /* 支撑相占比；复位相占剩余 20% */
 #define GAIT_SLEW_DEG           8        /* 每 tick 最大角度变化；必须大于
                                             摆动相速度，否则会把快摆削平 */
 #define GAIT_MAX_TILT_DEG       30.0f    /* 腿前后最大摆角（机械限位保护） */
@@ -111,7 +109,7 @@ typedef struct
    头部转 180° 后，新的前进方向 = 旧的后退方向，所以这里取 +1。
    如果实物上 S1 后反而往后退，把本宏改回 -1 即可（只影响前后）。
 
-   注意：方向翻转后，抬腿顺序也要跟着翻（见下方 s_phase_offset）。 */
+   Trot 的对角分组由实物腿位决定；改方向符号后仍需检查两组对角腿。 */
 #define GAIT_FORWARD_SIGN       (+1)
 
 /* ---- 直行标定（只在实物上微调，默认不改变原有行为）---- */
@@ -127,26 +125,20 @@ typedef struct
 #define GAIT_TRIM_3_DDEG        0
 #define GAIT_TRIM_4_DDEG        0
 
-/* 直行纠偏（%）：左右两侧的步幅比例，专门用来修“走不直”。
-   差值按侧施加：1/3 号腿（左侧）用 100+本值，2/4 号腿（右侧）
-   用 100-本值。直行偏左（机头往左拐）说明右侧每周期前进得多，
-   把本值改成正数加大左侧；偏右则改成负数。每次调 3~5%，
-   调到能走 1~2m 基本不偏为止。范围 -40~+40。 */
-#define GAIT_YAW_TRIM_PCT       2
-
-#if (GAIT_YAW_TRIM_PCT < -40) || (GAIT_YAW_TRIM_PCT > 40)
-#error "GAIT_YAW_TRIM_PCT must be -40..40"
-#endif
+/* 左侧步幅补偿（%）：PA8/PA10（1/3 号腿）增加本值，PA9/PA11 保持基准。 */
+#define GAIT_LEFT_STEP_BOOST_PCT   3
 
 /* 相位刻度：0~999 表示一个周期，全部用整数运算 */
 #define GAIT_PHASE_MAX          1000U
-#define GAIT_PHASE_STEP         ((uint16_t)((GAIT_PHASE_MAX * GAIT_TICK_MS) / GAIT_CYCLE_MS))
+/* 每次更新的最大相位增量；相位累加器保留余数以避免周期累计误差 */
+#define GAIT_PHASE_STEP_MAX     ((uint16_t)(((GAIT_PHASE_MAX * GAIT_TICK_MS) + \
+                                             GAIT_CYCLE_MS - 1U) / GAIT_CYCLE_MS))
 
 #if (GAIT_STANCE_PCT < 1U) || (GAIT_STANCE_PCT > 99U)
 #error "GAIT_STANCE_PCT must be 1..99"
 #endif
-#if (GAIT_STANCE_PCT < 75U)
-#warning "stance < 75% makes two legs swing at once (not a crawl)"
+#if (GAIT_STANCE_PCT <= 50U)
+#warning "stance <= 50% may reduce net displacement with this single-axis gait"
 #endif
 
 /* ---- S1 按键（PB3，下拉输入，按下为高电平） ---- */
@@ -219,31 +211,24 @@ static const int16_t s_servo_trim_ddeg[SERVO_COUNT] =
   GAIT_TRIM_1_DDEG, GAIT_TRIM_2_DDEG, GAIT_TRIM_3_DDEG, GAIT_TRIM_4_DDEG
 };
 
-/* 每路步幅比例（%）：左前/左后用 100+trim，右前/右后用 100-trim。
-   直行跑偏时改 GAIT_YAW_TRIM_PCT 即可，不必逐路改。 */
+/* 每路步幅比例（%）：左侧 PA8/PA10 增加补偿，右侧 PA9/PA11 为基准。 */
 static const int16_t s_servo_scale_pct[SERVO_COUNT] =
 {
-  (int16_t)(100 + GAIT_YAW_TRIM_PCT), (int16_t)(100 - GAIT_YAW_TRIM_PCT),
-  (int16_t)(100 + GAIT_YAW_TRIM_PCT), (int16_t)(100 - GAIT_YAW_TRIM_PCT)
+  (int16_t)(100 + GAIT_LEFT_STEP_BOOST_PCT), 100,
+  (int16_t)(100 + GAIT_LEFT_STEP_BOOST_PCT), 100
 };
 
 /*
- * 爬行步态相位偏移，索引 0~3 对应 1~4 号舵机（0~999 为一个周期）。
- * 每条腿 75% 时间支撑、25% 时间摆动，四条腿错开 1/4 周期，
- * 任意时刻只有一条腿在摆动，另外三条支撑，机身不会“跳”。
- *
- * 头部转 180° 后，行进方向变成了原机身的“后方”，而腿还挂在原来的
- * 位置（1=原左前、2=原右前、3=原左后、4=原右后）。如果相位表不动，
- * 按新方向看抬腿顺序会变成“同侧前腿先抬、后腿后抬”，也就是倒着走
- * 的序列，机身俯仰和横滚耦合，容易走偏、拖步。这里把相位表按新方向
- * 重新排成标准横向序列（同侧后腿先抬、前腿后抬）：
- *   新的左后(1) → 左前(3) → 右后(2) → 右前(4)
- * 等价于把 ble_walk_test 已验证的前进步态按时间反序（方向反过来走）。
+ * Trot 对角相位偏移，索引 0~3 对应 PA8~PA11（1~4 号舵机）。
+ * PA8(新左后)+PA11(新右前)同相；PA9(新右后)+PA10(新左前)同相，
+ * 两组相差半周期。每腿支撑 80%、复位 20%；单轴机构不主动抬脚，
+ * 因此这是对角配对的水平摆腿试验，不代表具有腾空相的动态小跑。
  */
-static const uint16_t s_phase_offset[SERVO_COUNT] = { 750U, 250U, 500U, 0U };
+static const uint16_t s_phase_offset[SERVO_COUNT] = { 0U, 500U, 500U, 0U };
 
 static Motion   s_motion = MOTION_STOP;      /* 当前运动，按键/障碍时修改 */
 static uint16_t s_gait_phase = 0U;           /* 步态相位 0~999 */
+static uint32_t s_gait_phase_remainder = 0U; /* 相位小数余数，保持实际周期准确 */
 static uint32_t s_last_gait_tick = 0U;       /* 上一次步态更新时刻 */
 
 /* 由机械尺寸算出的步幅参数（0.1° 为单位，Gait_Config 里初始化） */
@@ -433,7 +418,7 @@ static void Gait_Config(void)
    * 限速必须大于摆动相的实际速度，否则快摆会被削平、占空比失效，
    * 又会退化成“原地踏步”。这里按摆角自动核算，只升不降。
    */
-  need_ddeg = ((int32_t)s_amp_fwd_ddeg * 2 * GAIT_PHASE_STEP * 11) /
+  need_ddeg = ((int32_t)s_amp_fwd_ddeg * 2 * GAIT_PHASE_STEP_MAX * 11) /
               (10 * (int32_t)swing);
 
   if (need_ddeg > (int32_t)(GAIT_SLEW_DEG * 10))
@@ -475,7 +460,12 @@ static void Gait_Tick(void)
   /* 停止时冻结相位，下次启动从当前位置继续；运动中相位持续前进 */
   if (walking != 0U)
   {
-    s_gait_phase = (uint16_t)((s_gait_phase + GAIT_PHASE_STEP) % GAIT_PHASE_MAX);
+    uint32_t phase_numerator = s_gait_phase_remainder +
+                               (GAIT_PHASE_MAX * GAIT_TICK_MS);
+    uint16_t phase_advance = (uint16_t)(phase_numerator / GAIT_CYCLE_MS);
+
+    s_gait_phase_remainder = phase_numerator % GAIT_CYCLE_MS;
+    s_gait_phase = (uint16_t)((s_gait_phase + phase_advance) % GAIT_PHASE_MAX);
   }
 
   for (i = 0U; i < SERVO_COUNT; i++)
